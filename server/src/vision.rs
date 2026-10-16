@@ -2116,6 +2116,23 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_first_wolf_game_screenshot() {
+        // 狼吃羊(同平台另一款游戏, 棋子为红字狼/黑字羊)开局截图: 棋盘同为 5x5,
+        // 阵型与变体开局同构(羊三行在上、隔一空行、狼居中三列在底)。
+        // 现有管线应零改动识别成功(狼->炮 羊->兵 映射) -- 狼吃羊支持只差
+        // 斜线区走法等规则差异
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/target/wolf_real.png");
+        let Ok(reader) = xcap::image::ImageReader::open(path) else {
+            return;
+        };
+        let img = reader.decode().expect("解码截图失败").to_rgba8();
+        let det = detect_first(&img, None).unwrap_or_else(|e| panic!("狼吃羊截图识别失败: {e}"));
+        assert_eq!(det.board, game::middle_startpos_flipped());
+        assert!(!det.model.cannons_top);
+        assert!(det.model.glyph);
+    }
+
+    #[test]
     fn test_pos_roundtrip() {
         for y in 0..game::SIZE {
             for x in 0..game::SIZE {
