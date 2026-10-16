@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>三炮十五兵-测试棋盘</title>
+<style>
+    /* 配色对识别友好: 页面中灰背景、棋盘线低饱和棕色、棋子为实心彩色圆(白字) */
+    body { background: #565656; display: flex; flex-direction: column; align-items: center; font-family: system-ui, sans-serif; color: #eee; }
+    h3 { margin: 12px 0 4px; }
+    #board { position: relative; width: 340px; height: 340px; background: linear-gradient(160deg, #fdf3dd, #ecd9b0); border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
+    svg.lines { position: absolute; inset: 0; }
+    .cell { position: absolute; width: 68px; height: 68px; display: flex; align-items: center; justify-content: center; cursor: default; }
+    .cell.movable { cursor: pointer; }
+    .piece { width: 50px; height: 50px; border-radius: 50%; font-size: 32px; text-align: center; line-height: 46px; user-select: none; font-family: KaiTi, serif; box-shadow: 0 2px 4px rgba(0,0,0,.35); color: #fff; }
+    .piece.C { background: radial-gradient(circle at 35% 30%, #e06a5f, #b03a2e); border: 2px solid #8a2f24; }
+    .piece.S { background: radial-gradient(circle at 35% 30%, #6f9ad6, #35688f); border: 2px solid #27506f; }
+    .cell.sel .piece { outline: 3px solid #f0c040; }
+    .cell.mv::after { content: ""; position: absolute; width: 18px; height: 18px; border-radius: 50%; background: rgba(46, 204, 113, .5); }
+    .cell.cap.mv::after { width: 54px; height: 54px; background: none; border: 3px solid rgba(231, 76, 60, .7); }
+    #info { margin: 8px 0; font-size: 15px; }
+    button { margin: 4px; padding: 6px 14px; }
+</style>
+</head>
+<body>
+<h3>三炮十五兵 · 测试棋盘</h3>
+<div id="info">轮到: <b id="turn">炮方</b> · 已吃兵: <b id="eaten">0</b></div>
+<div id="board">
+    <svg class="lines" viewBox="0 0 340 340"></svg>
+</div>
+<div>
+    <button onclick="reset()">重开</button>
+    <button onclick="undo()">悔棋</button>
+</div>
+<script>
+// 用浏览器打开本页面, 在工具里选择本窗口开始监听, 即可端到端验证识别与提示
+const SIZE = 5, CELL = 68;
+let board, turn, history;
+
+function pos(x, y) { return "abcde"[x] + y; }
+function xy(p) { return ["abcde".indexOf(p[0]), +p[1]]; }
+
+function startpos() {
+    const b = Array.from({ length: SIZE }, () => Array(SIZE).fill(" "));
+    for (const x of [0, 2, 4]) b[0][x] = "C";
+    for (let y = 2; y < 5; y++) for (let x = 0; x < 5; x++) b[y][x] = "S";
+    return b;
+}
+
+function pieceMoves(b, x, y) {
+    const out = [];
+    const p = b[y][x];
+    if (!p || p === " ") return out;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < SIZE && ny < SIZE && b[ny][nx] === " ") out.push([nx, ny]);
+    }
+    if (p === "C") {
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+            let cx = x + dx, cy = y + dy, screen = false;
+            while (cx >= 0 && cy >= 0 && cx < SIZE && cy < SIZE) {
+                const cell = b[cy][cx];
+                if (cell !== " ") {
+                    if (!screen) screen = true;
+                    else { if (cell === "S") out.push([cx, cy]); break; }
+                }
+                cx += dx; cy += dy;
+            }
+        }
+    }
+    return out;
+}
+
+function legalMoves(camp) {
+    const want = camp === "C" ? "C" : "S";
+    const out = [];
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+        if (board[y][x] === want) for (const [tx, ty] of pieceMoves(board, x, y)) out.push(pos(x, y) + pos(tx, ty));
+    }
+    return out;
+}
+
+function winner() {
+    let soldiers = 0;
+    for (const row of board) for (const c of row) if (c === "S") soldiers++;
+    if (soldiers <= 2) return "炮方胜(兵已不足)";
+    const cMoves = legalMoves("C"), sMoves = legalMoves("S");
+    if (cMoves.length === 0) return "兵方胜(围困三炮)";
+    if (sMoves.length === 0) return "炮方胜(兵无路可走)";
+    return null;
+}
+
+let selected = null;
+
+function render() {
+    const el = document.getElementById("board");
+    el.querySelectorAll(".cell").forEach(n => n.remove());
+    const moves = selected ? pieceMoves(board, ...xy(selected)) : [];
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) {
+        const cell = document.createElement("div");
+        cell.className = "cell";
+        cell.style.left = (x * CELL) + "px";
+        cell.style.top = (y * CELL) + "px";
+        const p = board[y][x];
+        const id = pos(x, y);
+        if (p !== " ") {
+            const piece = document.createElement("div");
+            piece.className = "piece " + p;
+            piece.textContent = p === "C" ? "炮" : "兵";
+            cell.appendChild(piece);
+        }
+        if (selected === id) cell.classList.add("sel");
+        const mv = moves.find(([tx, ty]) => tx === x && ty === y);
+        if (mv) {
+            cell.classList.add("mv");
+            if (board[y][x] !== " ") cell.classList.add("cap");
+            cell.classList.add("movable");
+            cell.onclick = () => doMove(selected, id);
+        } else if (p !== " " && ((turn === "C" && p === "C") || (turn === "S" && p === "S"))) {
+            cell.classList.add("movable");
+            cell.onclick = () => { selected = id; render(); };
+        }
+        el.appendChild(cell);
+    }
+    document.getElementById("turn").textContent = turn === "C" ? "炮方" : "兵方";
+    document.getElementById("eaten").textContent = 15 - board.flat().filter(c => c === "S").length;
+}
+
+function doMove(from, to) {
+    const legal = legalMoves(turn);
+    const mv = from + to;
+    if (!legal.includes(mv)) return;
+    history.push(JSON.stringify(board) + turn);
+    const [fx, fy] = xy(from), [tx, ty] = xy(to);
+    board[ty][tx] = board[fy][fx];
+    board[fy][fx] = " ";
+    selected = null;
+    turn = turn === "C" ? "S" : "C";
+    const w = winner();
+    render();
+    if (w) setTimeout(() => alert(w), 50);
+}
+
+function undo() {
+    const prev = history.pop();
+    if (!prev) return;
+    board = JSON.parse(prev.slice(0, -1));
+    turn = prev.slice(-1);
+    selected = null;
+    render();
+}
+
+function reset() {
+    board = startpos();
+    turn = "C";
+    history = [];
+    selected = null;
+    render();
+}
+
+// 画网格线(低饱和棕色, 不干扰棋子识别)
+(function drawLines() {
+    const svg = document.querySelector("svg.lines");
+    const c = (i) => i * CELL + CELL / 2;
+    let html = `<g stroke="#9c7a4f" stroke-width="2.5">`;
+    for (let i = 0; i < SIZE; i++) {
+        html += `<line x1="${c(0)}" y1="${c(i)}" x2="${c(SIZE - 1)}" y2="${c(i)}"/>`;
+        html += `<line x1="${c(i)}" y1="${c(0)}" x2="${c(i)}" y2="${c(SIZE - 1)}"/>`;
+    }
+    html += `</g><rect x="${c(0)}" y="${c(0)}" width="${c(SIZE - 1) - c(0)}" height="${c(SIZE - 1) - c(0)}" fill="none" stroke="#9c7a4f" stroke-width="3"/>`;
+    svg.innerHTML = html;
+})();
+
+reset();
+</script>
+</body>
+</html>
