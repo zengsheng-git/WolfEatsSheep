@@ -127,7 +127,7 @@ async function startListen() {
 
         // 显示窗口选择对话框
         dialog.info({
-            title: "选择要监听的窗口(需显示标准开局棋盘)",
+            title: "选择要监听的窗口(棋盘需完整可见, 任意局面均可)",
             class: "window-select-dialog",
             content: () =>
                 h(NFlex, { vertical: true, style: "gap: 16px" }, [

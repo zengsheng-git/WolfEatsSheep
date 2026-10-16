@@ -261,17 +261,21 @@ impl AnalysisContext {
     }
 
     // 手动纠错: 以用户标注的局面为准重同步
-    // 先用标注格上的色块重采样两方颜色质心(纠正分类漂移), 再按指定行棋方重新分析
+    // 先检测标注局面与当前识别是否只差一个整体平移(任意局面启动时端部空行/列
+    // 归属判错所致), 是则平移网格模型对齐; 再用标注格上的色块重采样两方颜色质心
+    // (纠正分类漂移), 最后按指定行棋方重新分析
     fn apply_calibration(&mut self, board: Board, turn: Camp) -> ChessboardState {
-        if let Some(image) = self.window.capture()
-            && let Some((cc, sc)) = vision::calibrate_colors(&self.model, &image, &board)
-        {
-            info!(
-                "手动纠错: 颜色质心重校准 炮=({:.0},{:.0},{:.0}) 兵=({:.0},{:.0},{:.0})",
-                cc[0], cc[1], cc[2], sc[0], sc[1], sc[2]
-            );
-            self.model.cannon_color = cc;
-            self.model.soldier_color = sc;
+        if let Some(image) = self.window.capture() {
+            self.align_model(&board, &image);
+            if let Some((cc, sc)) = vision::calibrate_colors(&self.model, &image, &board)
+            {
+                info!(
+                    "手动纠错: 颜色质心重校准 炮=({:.0},{:.0},{:.0}) 兵=({:.0},{:.0},{:.0})",
+                    cc[0], cc[1], cc[2], sc[0], sc[1], sc[2]
+                );
+                self.model.cannon_color = cc;
+                self.model.soldier_color = sc;
+            }
         }
         self.reset_for_new_game(board);
         self.update_ui(board);
@@ -286,6 +290,31 @@ impl AnalysisContext {
         } else {
             ChessboardState::OpponentTurn
         }
+    }
+
+    // 网格平移对齐: 依次尝试 ±4 格内的整体平移重新识别(不平移最先), 与标注局面
+    // 完全一致的平移被采纳。任意局面启动时端部空行/列归属推断错误表现为
+    // "识别局面 = 真实局面整体平移一格", 用户在镜像棋盘上标注出真实局面后,
+    // 以此把网格几何修正到真实格点上(标注内容本身无法表达几何错位)
+    fn align_model(&mut self, board: &Board, image: &ImageBuffer<Rgba<u8>, Vec<u8>>) {
+        let mut cands: Vec<(i32, i32)> = Vec::new();
+        for dy in -4i32..=4 {
+            for dx in -4i32..=4 {
+                cands.push((dy, dx));
+            }
+        }
+        cands.sort_by_key(|&(dy, dx)| (dy.abs() + dx.abs(), dy, dx));
+        for &(dy, dx) in &cands {
+            let shifted = self.model.shifted(dx, dy);
+            if vision::detect_frame(&shifted, image).as_ref() == Some(board) {
+                if dx != 0 || dy != 0 {
+                    info!("手动纠错: 网格整体平移 ({dx},{dy}) 对齐标注局面");
+                    self.model = shifted;
+                }
+                return;
+            }
+        }
+        warn!("手动纠错: 标注局面与任何网格平移都不一致, 保持原网格");
     }
 }
 
@@ -609,7 +638,8 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
             return Err("无法截取目标窗口画面".to_string());
         };
 
-        // 首帧必须识别出标准开局, 由此确定网格几何与两方颜色
+        // 首帧自举网格几何与两方颜色(开局指纹优先, 任意局面拟合兜底, 见 vision::detect_first),
+        // 失败时保存首帧截图, 便于按真实画面调优识别参数
         let detect = match vision::detect_first(&image) {
             Ok(det) => det,
             Err(e) => {
@@ -638,7 +668,7 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
         };
         trace!("首帧局面: {:?}", detect.board);
         window.set_sub_bound(detect.crop.0, detect.crop.1, detect.crop.2, detect.crop.3);
-        info!("识别到开局棋盘, crop={:?} cannons_top={}", detect.crop, detect.model.cannons_top);
+        info!("识别到棋盘, crop={:?} cannons_top={}", detect.crop, detect.model.cannons_top);
 
         let context = AnalysisContext::new(app.clone(), window, detect.model);
         let listen_thread = thread::spawn(move || {

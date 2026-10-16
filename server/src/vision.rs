@@ -1,6 +1,8 @@
 // 三炮十五兵棋盘识别: 经典 CV 管线, 替代原项目的 YOLO ONNX 模型
-// 思路: 棋子是棋盘上唯一的"圆形色块" -> 连通域提取 -> 由开局阵型指纹拟合 5x5 网格
-//       -> 开局位置自举两方颜色质心 -> 后续帧按网格归属 + 最近色心分类
+// 思路: 棋子是棋盘上唯一的"圆形色块" -> 连通域提取 -> 拟合 5x5 网格
+//       -> 自举两方颜色质心 -> 后续帧按网格归属 + 最近色心分类
+// 网格拟合有两条路: 开局阵型指纹(首帧恰为开局时的可靠路径)与任意局面拟合
+// (等距格点 RANSAC, 对局进行中接入监听时使用, 见 fit_arbitrary)
 // 网格线若颜色饱和会被一并掩码, 且线条穿过棋子中心会把棋子连通成片;
 // 对此提供腐蚀通道(5x5 腐蚀切断细线、保留实心棋子), 主通道指纹失败时自动启用
 use xcap::image::{ImageBuffer, Rgba};
@@ -29,6 +31,24 @@ pub struct GridModel {
     pub eroded: bool,
     /// true=字形通道(黑字兵/红字炮, 橙红底平台如微信小程序)
     pub glyph: bool,
+}
+
+impl GridModel {
+    /// 网格整体平移 k 格(正 = 向右/向下)。任意局面启动时端部空行/列的归属可能
+    /// 判错(棋盘相对识别整体错位一格), "纠"按钮发现标注局面与平移后的识别一致
+    /// 时调用它对齐; 格点等距, 均匀平移即等价于重排窗口
+    pub fn shifted(&self, dx: i32, dy: i32) -> GridModel {
+        let mut m = self.clone();
+        let sx = dx as f32 * self.cell;
+        let sy = dy as f32 * self.cell;
+        for x in &mut m.xs {
+            *x += sx;
+        }
+        for y in &mut m.ys {
+            *y += sy;
+        }
+        m
+    }
 }
 
 
@@ -438,7 +458,7 @@ fn nearest_index(values: &[f32], v: f32) -> usize {
     best
 }
 
-// 首帧识别: 依次尝试多个通道, 任一通道拟合出开局指纹即成功
+// 首帧识别: 依次尝试多个通道, 任一通道拟合出开局指纹或任意局面网格即成功
 // 通道 = (是否字形掩码, 腐蚀半径):
 //   实心彩色棋子平台走彩色通道; 橙红底+黑红字平台(微信小程序)走字形通道;
 //   腐蚀变体切断被掩码的网格线, 避免线条把棋子连成片
@@ -449,7 +469,12 @@ pub fn detect_first(img: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> Result<FirstDetect,
     let mut best_err: Option<(String, usize)> = None;
     for &(glyph, erode) in &channels {
         let (blobs, step) = extract_blobs(img, 1024, erode, glyph);
-        match fit_startpos(&blobs, step, iw, ih, glyph, erode != 0) {
+        // 开局指纹优先(开局局面的既有可靠路径), 失败再按任意局面拟合,
+        // 让监听可以从对局进行中的任意局面启动
+        if let Ok(det) = fit_startpos(&blobs, step, iw, ih, glyph, erode != 0) {
+            return Ok(det);
+        }
+        match fit_arbitrary(&blobs, step, iw, ih, glyph, erode != 0) {
             Ok(det) => return Ok(det),
             Err(e) => {
                 if best_err.as_ref().map(|(_, n)| blobs.len() > *n).unwrap_or(true) {
@@ -664,6 +689,491 @@ fn combos(items: &[usize], k: usize) -> Vec<Vec<usize>> {
 }
 
 
+// ---- 任意局面自举(不依赖开局指纹) ----
+
+// 一维等距格点拟合: 相位按 s/40 步长细扫(而非锚定在色块上——腐蚀通道下
+// 兵/炮字形质心向相反方向偏离格点, 真实格点可能在任何色块之间),
+// 取"5 格窗口内点数"最大的 (间距, 相位); 同分保留更大间距。
+// 吸附容差 0.22 格: 需同时罩住兵(~-0.17 格)与炮(~+0.13 格)的质心偏移
+const SNAP_FRAC: f32 = 0.22;
+
+// 一个候选窗口: 窗口内点数与 5 个格点坐标(升序)
+struct WindowFit {
+    score: usize,
+    positions: Vec<f32>,
+}
+
+// 一维等距格点拟合结果: 接近最高分的全部窗口候选(按得分降序、位置靠上优先)。
+// 棋盘外的装饰行(金色标记/底部按钮)或端部整行空出都可能让最高分窗口不是
+// 真棋盘, 真伪由上层结合棋子分类校验(炮恒 3)选定
+struct AxisFit {
+    windows: Vec<WindowFit>,
+    spacing: f32,
+    /// 得分最高窗口中有色块吸附的不同格点数
+    distinct: usize,
+}
+
+fn best_lattice(coords: &[f32], spacings: &[f32]) -> Option<AxisFit> {
+    let n = coords.len();
+    if n < 2 || spacings.is_empty() {
+        return None;
+    }
+    let snap = |s: f32, phase: f32| -> Vec<Option<i32>> {
+        coords
+            .iter()
+            .map(|&c| {
+                let k = ((c - phase) / s).round() as i32;
+                if (c - (phase + k as f32 * s)).abs() <= s * SNAP_FRAC {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    // 5 格窗口 [lo, lo+4] 内的色块数; 窗口外的"内点"按噪声不计分
+    let windows_of = |ks: &[Option<i32>]| -> Vec<(usize, i32)> {
+        let flat: Vec<i32> = ks.iter().flatten().copied().collect();
+        if flat.is_empty() {
+            return Vec::new();
+        }
+        let kmin = *flat.iter().min().unwrap();
+        let kmax = *flat.iter().max().unwrap();
+        (kmin..=kmax).map(|lo| (flat.iter().filter(|&&k| k >= lo && k <= lo + 4).count(), lo)).collect()
+    };
+
+    let mut sorted = spacings.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    // 每个间距的局部最优 (得分, 相位): 按 s/40 步长细扫全周期
+    let mut per_s: Vec<(usize, f32, f32)> = Vec::new();
+    #[cfg(test)]
+    let mut all_scores: Vec<(usize, f32, f32)> = Vec::new();
+    for &s in &sorted {
+        let mut local_best: Option<(usize, f32)> = None;
+        for si in 0..40 {
+            let phase = s * si as f32 / 40.0;
+            let Some(score) = windows_of(&snap(s, phase)).iter().map(|w| w.0).max() else {
+                continue;
+            };
+            if local_best.as_ref().map(|b| score > b.0).unwrap_or(true) {
+                local_best = Some((score, phase));
+            }
+        }
+        if let Some((score, phase)) = local_best {
+            #[cfg(test)]
+            all_scores.push((score, s, phase));
+            per_s.push((score, s, phase));
+        }
+    }
+    #[cfg(test)]
+    if std::env::var("SANPAO_DEBUG").is_ok() {
+        all_scores.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+        println!("  [best_lattice] top candidates (score, spacing, phase): {:?}", &all_scores[..all_scores.len().min(8)]);
+    }
+    let max_score = per_s.iter().map(|x| x.0).max().filter(|s| *s >= 2)?;
+    // 并列最高分的间距取"窗口内点最大残差最小"者: 兵/炮字形质心向相反方向
+    // 偏移时格点只能取两侧折中, 残差最小的间距才能同时罩住两营; 仍平手取更大间距
+    let mut tied: Vec<(f32, f32, f32)> = per_s
+        .iter()
+        .filter(|x| x.0 == max_score)
+        .filter_map(|&(_, s, phase)| {
+            let ks = snap(s, phase);
+            let (_, lo) = windows_of(&ks).iter().max_by_key(|w| w.0).copied()?;
+            let minimax = ks
+                .iter()
+                .zip(coords)
+                .filter_map(|(k, &c)| k.filter(|k| (lo..=lo + 4).contains(k)).map(|k| (c - (phase + k as f32 * s)).abs()))
+                .fold(0f32, f32::max);
+            Some((minimax, s, phase))
+        })
+        .collect();
+    tied.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.total_cmp(&a.1)));
+    let (_, s, phase) = tied.first().copied()?;
+    let ks = snap(s, phase);
+    // 得分与最高分相差 3 以内的窗口都作为候选(按得分降序、位置靠上优先),
+    // 真伪由上层结合棋子分类校验选定; 上限 6 个控制组合数
+    let mut cands: Vec<(usize, i32)> = windows_of(&ks).into_iter().filter(|(c, _)| c + 3 >= max_score).collect();
+    cands.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    cands.truncate(6);
+    let windows: Vec<WindowFit> = cands
+        .into_iter()
+        .map(|(score, lo)| WindowFit {
+            score,
+            positions: (0..5).map(|i| phase + (lo + i) as f32 * s).collect(),
+        })
+        .collect();
+    let top_lo = windows.first().map(|w| (w.positions[4] - phase) / s) // 反解 top 窗口的 lo
+        .map(|kmax| kmax as i32 - 4);
+    let distinct = match top_lo {
+        Some(lo) => {
+            let mut used: Vec<i32> = ks.iter().flatten().copied().filter(|k| (lo..=lo + 4).contains(k)).collect();
+            used.sort_unstable();
+            used.dedup();
+            used.len()
+        }
+        None => 0,
+    };
+    Some(AxisFit { windows, spacing: s, distinct })
+}
+
+// 候选间距来自全部点对距离除以 1..4(真实间距的整倍数必在其中), 去重后交给 best_lattice
+fn fit_lattice(coords: &[f32], min_s: f32, max_s: f32) -> Option<AxisFit> {
+    let mut cands: Vec<f32> = Vec::new();
+    for i in 0..coords.len() {
+        for j in i + 1..coords.len() {
+            let d = (coords[i] - coords[j]).abs();
+            if d < 1e-6 {
+                continue;
+            }
+            for k in 1..=4u32 {
+                let s = d / k as f32;
+                if s >= min_s && s <= max_s {
+                    cands.push(s);
+                }
+            }
+        }
+    }
+    cands.sort_by(|a, b| a.total_cmp(b));
+    let mut uniq: Vec<f32> = Vec::new();
+    for s in cands {
+        if uniq.last().map(|u| s - u > *u * 0.03).unwrap_or(true) {
+            uniq.push(s);
+        }
+    }
+    best_lattice(coords, &uniq)
+}
+
+// 间距已知时只拟相位: 某轴分布退化(不同格点不足 3 个)无法自证间距, 借用另一轴的间距
+fn fit_phase(coords: &[f32], s: f32) -> Option<AxisFit> {
+    best_lattice(coords, &[s])
+}
+
+// 颜色主导性过滤: 棋盘上棋子只有两种颜色, 距两大主色都远的色块是界面噪声
+// (按钮/文字颜色五花八门, 且可能成排出现, 以数量优势把等距拟合带偏),
+// 标记为不参与格点拟合(仍参与最终格点吸附)。簇心取各通道中位数而非均值,
+// 避免混入簇内的少量噪声把簇心拉偏后噪声反被保留
+fn color_dominant(blobs: &[Blob]) -> Vec<bool> {
+    let n = blobs.len();
+    if n < 2 {
+        return vec![true; n];
+    }
+    let dist2 = |a: [f64; 3], b: [f64; 3]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
+    // 以互相最远的一对色块为初始中心(确定性), Lloyd 迭代至稳定
+    let farthest = |c: [f64; 3]| blobs.iter().map(|b| b.rgb).max_by(|a, b| dist2(*a, c).total_cmp(&dist2(*b, c))).unwrap();
+    let (mut c0, mut c1) = {
+        let c1 = farthest(blobs[0].rgb);
+        (farthest(c1), c1)
+    };
+    let mut assign = vec![0usize; n];
+    for _ in 0..12 {
+        let mut changed = false;
+        for (i, b) in blobs.iter().enumerate() {
+            let a = if dist2(b.rgb, c0) <= dist2(b.rgb, c1) { 0 } else { 1 };
+            if assign[i] != a {
+                assign[i] = a;
+                changed = true;
+            }
+        }
+        for (c, center) in [&mut c0, &mut c1].into_iter().enumerate() {
+            let mut acc = [0f64; 3];
+            let mut cnt = 0usize;
+            for (i, b) in blobs.iter().enumerate() {
+                if assign[i] == c {
+                    acc = add3(acc, b.rgb);
+                    cnt += 1;
+                }
+            }
+            if cnt > 0 {
+                *center = scale3(acc, 1.0 / cnt as f64);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // 簇心取成员各通道中位数(抗混入簇内的噪声)
+    let median3 = |want: usize| -> Option<[f64; 3]> {
+        let members: Vec<[f64; 3]> = blobs.iter().enumerate().filter(|&(i, _)| assign[i] == want).map(|(_, b)| b.rgb).collect();
+        if members.is_empty() {
+            return None;
+        }
+        let mut out = [0f64; 3];
+        for ch in 0..3 {
+            let mut v: Vec<f64> = members.iter().map(|m| m[ch]).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            out[ch] = v[v.len() / 2];
+        }
+        Some(out)
+    };
+    let (Some(m0), Some(m1)) = (median3(0), median3(1)) else {
+        return vec![true; n]; // 某簇为空(全同色), 不过滤
+    };
+    // 距两簇心都超过 0.7 倍簇间距的是噪声色; 下限 40 防止两色相近时误杀棋子
+    let thresh = (0.7 * dist2(m0, m1).sqrt()).max(40.0);
+    blobs
+        .iter()
+        .map(|b| dist2(b.rgb, m0).sqrt().min(dist2(b.rgb, m1).sqrt()) <= thresh)
+        .collect()
+}
+
+// 在盘棋子引用: (列索引, 行索引, 色块)
+type PieceRefs<'a> = Vec<(usize, usize, &'a Blob)>;
+
+// 把在盘棋子分成炮/兵两营:
+// 字形通道: 红字炮以高饱和像素为主, 黑字兵以墨迹为主; 炮候选按红度 r-g 排序取
+//   前 3 个(字形暗红 r-g>=97 高于金色走子标记的 ~95), 多余候选当作标记丢弃;
+//   尺寸明显大于中位数的非炮块是"叠了标记的空槽"等装饰, 不计入兵
+// 彩色通道: 棋子是两种颜色的实心盘, 按颜色 2 均值聚成两簇, 恰好 3 枚的一簇是炮
+fn classify_pieces<'a>(pieces: &'a [(usize, usize, &'a Blob)], glyph: bool, med: f32) -> Result<(PieceRefs<'a>, PieceRefs<'a>), String> {
+    if glyph {
+        let ratio = |b: &Blob| b.colored as f32 / b.area as f32;
+        let mut cands: Vec<(usize, usize, &Blob)> = pieces
+            .iter()
+            .filter(|&&(_, _, b)| ratio(b) >= 0.5)
+            .map(|&(ix, iy, b)| (ix, iy, b))
+            .collect();
+        if cands.len() < 3 {
+            return Err(format!("炮的候选仅 {} 个(需 3 个), 拟合失败", cands.len()));
+        }
+        // 红度降序: 真炮排在金色走子标记之前
+        cands.sort_by(|a, b| (b.2.rgb[0] - b.2.rgb[1]).total_cmp(&(a.2.rgb[0] - a.2.rgb[1])));
+        let cannons: Vec<(usize, usize, &Blob)> = cands.iter().take(3).map(|&(ix, iy, b)| (ix, iy, b)).collect();
+        // 0.6 而非 0.5: 叠加标记的兵墨迹占比可能恰好过半, 宁可放宽不丢兵
+        // (放宽误收的块由"炮恒 3"竞争与下面的尺寸过滤排除)
+        let soldiers: Vec<(usize, usize, &Blob)> = pieces
+            .iter()
+            .filter(|&&(_, _, b)| ratio(b) < 0.6 && b.area as f32 <= med * 1.8)
+            .map(|&(ix, iy, b)| (ix, iy, b))
+            .collect();
+        if soldiers.is_empty() {
+            return Err("未识别到兵方棋子(对局可能已结束), 拟合失败".to_string());
+        }
+        Ok((cannons, soldiers))
+    } else {
+        let rgb = |p: &(usize, usize, &Blob)| -> [f32; 3] { p.2.rgb.map(|v| v as f32) };
+        let dist2 = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
+        // 2 均值: 以互相最远的一对色块为初始中心(确定性), Lloyd 迭代至稳定
+        let farthest = |c: [f32; 3]| rgb(pieces.iter().max_by(|a, b| dist2(rgb(a), c).total_cmp(&dist2(rgb(b), c))).unwrap());
+        let (mut c0, mut c1) = {
+            let c1 = farthest(rgb(&pieces[0]));
+            let c0 = farthest(c1);
+            (c0, c1)
+        };
+        let mut assign = vec![0usize; pieces.len()];
+        for _ in 0..12 {
+            let mut changed = false;
+            for (i, p) in pieces.iter().enumerate() {
+                let a = if dist2(rgb(p), c0) <= dist2(rgb(p), c1) { 0 } else { 1 };
+                if assign[i] != a {
+                    assign[i] = a;
+                    changed = true;
+                }
+            }
+            for (c, center) in [&mut c0, &mut c1].into_iter().enumerate() {
+                let mut acc = [0f64; 3];
+                let mut cnt = 0usize;
+                for (i, p) in pieces.iter().enumerate() {
+                    if assign[i] == c {
+                        acc = add3(acc, p.2.rgb);
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    *center = scale3(acc, 1.0 / cnt as f64).map(|v| v as f32);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let cl0: Vec<(usize, usize, &Blob)> = pieces.iter().enumerate().filter(|&(i, _)| assign[i] == 0).map(|(_, p)| *p).collect();
+        let cl1: Vec<(usize, usize, &Blob)> = pieces.iter().enumerate().filter(|&(i, _)| assign[i] == 1).map(|(_, p)| *p).collect();
+        // 两簇心必须显著可分: 真平台两色棋子簇心距离远(红/蓝 ~200);
+        // 杂色噪声块(木色调界面)强分出来的两簇几乎同色, 是误报
+        let sep = dist2(c0, c1).sqrt();
+        if sep < 60.0 {
+            return Err(format!("两簇棋子颜色几乎相同(簇心距 {sep:.0}), 不是双色棋盘, 拟合失败"));
+        }
+        match (cl0.len(), cl1.len()) {
+            (3, 3) => Err("炮兵两簇各 3 枚, 无法区分阵营, 拟合失败".to_string()),
+            (3, _) => Ok((cl0, cl1)),
+            (_, 3) => Ok((cl1, cl0)),
+            (a, b) => Err(format!("无法按颜色区分炮/兵(两簇 {a}/{b} 枚, 炮簇须恰为 3), 拟合失败")),
+        }
+    }
+}
+
+// 由任意局面自举: 对色块 x/y 各做一维等距格点拟合得到 5x5 网格, 吸附到格点的
+// 非装饰色块按颜色分为炮/兵, 由此建立网格模型与两方颜色质心。
+// 监听启动时对局已在进行中、无法回到开局的场景走这条路(开局指纹失败后兜底)。
+// 已知局限: 端部整行/列空出时网格端点有平移歧义 -- 行按"空端行在炮侧"推断
+// (炮的家在边行, 全部离家后家行空出; 兵推进致自家远端空出时会推错),
+// 列默认靠左; 推错由"纠"按钮兜底(标注局面与识别恰为整体平移时, 网格随之平移)
+fn fit_arbitrary(blobs: &[Blob], step: usize, iw: u32, ih: u32, glyph: bool, eroded: bool) -> Result<FirstDetect, String> {
+    if blobs.len() < 4 {
+        return Err(format!("识别到 {} 个色块, 至少需要 4 个(3 炮 + 存活兵), 请确保棋盘完整可见", blobs.len()));
+    }
+    let scale = step as f32;
+    let med = median_area(blobs);
+    // 间距下界: 棋子等价直径的 1.1 倍(相邻棋子中心距即格距); 上界: 棋盘 5 格须在画面内
+    let min_s = (1.1 * 2.0 * (med / std::f32::consts::PI).sqrt()).max(8.0);
+    // 格点拟合只用两大主色的色块(排除成排的界面噪声), 吸附阶段再用全部色块
+    let keep = color_dominant(blobs);
+    let xs: Vec<f32> = blobs.iter().zip(&keep).filter(|(_, k)| **k).map(|(b, _)| b.cx).collect();
+    let ys: Vec<f32> = blobs.iter().zip(&keep).filter(|(_, k)| **k).map(|(b, _)| b.cy).collect();
+    let fx = fit_lattice(&xs, min_s, iw as f32 / scale / 4.5);
+    let fy = fit_lattice(&ys, min_s, ih as f32 / scale / 4.5);
+    // 每轴至少 3 个不同格点才能自证间距; 一轴退化时借用另一轴的间距只拟相位
+    let (fx, fy) = match (&fx, &fy) {
+        (Some(a), Some(b)) if a.distinct >= 3 && b.distinct >= 3 => {
+            // 棋盘是正方形网格且屏幕无透视, 真帧横纵间距差在 6% 以内;
+            // 收紧到 15% 以拒绝杂色噪声块拼出的伪网格(实测可差 18%+)
+            if (a.spacing - b.spacing).abs() > a.spacing.max(b.spacing) * 0.15 {
+                return Err("棋盘横纵间距不一致, 任意局面拟合失败".to_string());
+            }
+            (fx.unwrap(), fy.unwrap())
+        }
+        (Some(a), None) if a.distinct >= 3 => {
+            let fy = fit_phase(&ys, a.spacing).ok_or("行方向棋子分布退化, 拟合失败")?;
+            (fx.unwrap(), fy)
+        }
+        (None, Some(b)) if b.distinct >= 3 => {
+            let fx = fit_phase(&xs, b.spacing).ok_or("列方向棋子分布退化, 拟合失败")?;
+            (fx, fy.unwrap())
+        }
+        _ => return Err("棋子分布过于稀疏, 无法定位棋盘网格(需分布在至少 3 行和 3 列)".to_string()),
+    };
+
+    // 窗口候选逐组合尝试: 吸附到格点 -> 分类 -> 数量校验全部通过才算成功。
+    // 棋盘外的装饰行/端部整行空出都可能让得分最高的窗口不是真棋盘,
+    // 错误窗口会因"炮候选凑不齐 3 个"或分类数量异常被淘汰
+    let deco = make_deco_filter(glyph, blobs);
+    let attempt = |xpos: &[f32], ypos: &[f32]| -> Result<FirstDetect, String> {
+        // 吸附到格点(两轴都距格点 SNAP_FRAC 格内)的主色、非装饰色块为在盘棋子
+        let snap_index = |positions: &[f32], spacing: f32, c: f32| -> Option<usize> {
+            let i = nearest_index(positions, c);
+            ((c - positions[i]).abs() <= spacing * SNAP_FRAC).then_some(i)
+        };
+        let pieces: Vec<(usize, usize, &Blob)> = blobs
+            .iter()
+            .zip(&keep)
+            .filter(|(_, k)| **k)
+            .filter_map(|(b, _)| {
+                Some((
+                    snap_index(xpos, fx.spacing, b.cx)?,
+                    snap_index(ypos, fy.spacing, b.cy)?,
+                    b,
+                ))
+            })
+            .filter(|(_, _, b)| !deco(b))
+            .collect();
+        #[cfg(test)]
+        if std::env::var("SANPAO_DEBUG").is_ok() {
+            println!(
+                "  [fit_arbitrary] xs={xpos:?} ys={ypos:?} sx={:.1} sy={:.1} keep={}",
+                fx.spacing,
+                fy.spacing,
+                keep.iter().filter(|k| **k).count()
+            );
+            for (i, b) in blobs.iter().enumerate() {
+                println!(
+                    "  [blob{}] ({:.0},{:.0}) area={} colored={} ix={:?} iy={:?} deco={} rgb=({:.0},{:.0},{:.0})",
+                    i, b.cx, b.cy, b.area, b.colored,
+                    if keep[i] { snap_index(xpos, fx.spacing, b.cx) } else { None },
+                    if keep[i] { snap_index(ypos, fy.spacing, b.cy) } else { None },
+                    deco(b), b.rgb[0], b.rgb[1], b.rgb[2]
+                );
+            }
+            println!("  [fit_arbitrary] pieces={}", pieces.len());
+        }
+        if pieces.len() < 4 {
+            return Err(format!("吸附到网格的棋子仅 {} 个(至少 3 炮 + 1 兵), 拟合失败", pieces.len()));
+        }
+        let (cannons, soldiers) = classify_pieces(&pieces, glyph, med)?;
+
+        // 端部空行的归属: 空端行在炮所在一侧; 列无类似信号, 默认靠左。
+        // 棋子块占窗口相对行 [y_min, y_max], 整体放入棋盘时以 y_min 为基准平移
+        let mean_y = |ps: &[(usize, usize, &Blob)]| ps.iter().map(|p| p.1 as f32).sum::<f32>() / ps.len() as f32;
+        let (y_min, y_max) = pieces.iter().map(|p| p.1).fold((usize::MAX, 0), |(lo, hi), y| (lo.min(y), hi.max(y)));
+        let offset_y = if y_max - y_min < 4 && mean_y(&cannons) + 0.3 < mean_y(&soldiers) {
+            4 - (y_max - y_min)
+        } else {
+            0
+        };
+
+        let mut board = [[EMPTY; game::SIZE]; game::SIZE];
+        for &(ix, iy, _) in &cannons {
+            board[iy - y_min + offset_y][ix] = CANNON;
+        }
+        for &(ix, iy, _) in &soldiers {
+            board[iy - y_min + offset_y][ix] = SOLDIER;
+        }
+        let (c, s) = game::counts(&board);
+        // 兵至少 2 枚: 只剩 1 枚兵的对局一步就终局, 而错误窗口拼出的伪局面
+        // 常恰好只有 1 枚"兵"
+        if c != 3 || !(2..=15).contains(&s) {
+            return Err(format!("棋子分类异常(炮 {c} 兵 {s}), 拟合失败"));
+        }
+
+        let mean_color = |ps: &[(usize, usize, &Blob)]| -> [f32; 3] {
+            let mut acc = [0f64; 3];
+            for p in ps {
+                acc = add3(acc, p.2.rgb);
+            }
+            scale3(acc, 1.0 / ps.len() as f64).map(|v| v as f32)
+        };
+        let cannons_top = mean_y(&cannons) < mean_y(&soldiers);
+        let cell = (fx.spacing + fy.spacing) / 2.0;
+        // 裁剪框比开局路径外扩到 1.8 格(开局是 0.8): 端部行列归属可能有误,
+        // "纠"按钮平移对齐后新端点行/列仍须在裁剪框内
+        let x0 = ((xpos[0] - fx.spacing * 1.8).max(0.0) * scale) as u32;
+        let y0 = ((ypos[0] - fy.spacing * 1.8).max(0.0) * scale) as u32;
+        let x1 = (((xpos[4] + fx.spacing * 1.8) * scale) as u32).min(iw);
+        let y1 = (((ypos[4] + fy.spacing * 1.8) * scale) as u32).min(ih);
+        let crop = (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0));
+        let model = GridModel {
+            xs: xpos.iter().map(|x| x * scale - x0 as f32).collect(),
+            ys: ypos.iter().map(|y| y * scale - y0 as f32).collect(),
+            cell: cell * scale,
+            cannon_color: mean_color(&cannons),
+            soldier_color: mean_color(&soldiers),
+            cannons_top,
+            eroded,
+            glyph,
+        };
+        Ok(FirstDetect { board, model, crop })
+    };
+    // 全部组合评完取通过校验且窗口得分最高者: 错误窗口可能凑出恰好合法的
+    // 伪局面(3 炮 + 少量兵), 但其窗口得分低于真棋盘(吸附的棋子更少)
+    let mut best_pass: Option<(usize, FirstDetect)> = None;
+    let mut last_err = String::new();
+    for wy in &fy.windows {
+        for wx in &fx.windows {
+            let combo_score = wy.score + wx.score;
+            if best_pass.as_ref().is_some_and(|(s, _)| combo_score <= *s) {
+                continue;
+            }
+            match attempt(&wx.positions, &wy.positions) {
+                Ok(det) => best_pass = Some((combo_score, det)),
+                Err(e) => {
+                    if last_err.is_empty() {
+                        last_err = e;
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, det)) = best_pass {
+        return Ok(det);
+    }
+    Err(if last_err.is_empty() {
+        "未产生任何网格窗口候选, 拟合失败".to_string()
+    } else {
+        last_err
+    })
+}
+
+
 // 平台会在刚走动的棋子/出发格上叠加红金色调标记(落在红字掩码内), 因此:
 // 1. 炮恒为 3: 炮色候选全局只保留颜色最贴近炮质心的 3 个, 多余的视为标记;
 // 2. 标记格点的归属: 含像兵的色块、或深色墨迹占多数(字形本底还在, 只是均色被
@@ -736,11 +1246,16 @@ pub fn detect_frame(model: &GridModel, img: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> 
 }
 
 
-// 装饰块过滤(字形通道): 棋子字形尺寸一致, 而炮位空槽等装饰是无彩深色且明显更大
-fn make_deco_filter(glyph: bool, blobs: &[Blob]) -> impl Fn(&Blob) -> bool + '_ {
+// 色块面积中位数(棋子尺寸的典型值)
+fn median_area(blobs: &[Blob]) -> f32 {
     let mut areas: Vec<usize> = blobs.iter().map(|b| b.area).collect();
     areas.sort_unstable();
-    let med = areas.get(areas.len() / 2).map(|v| *v as f32).unwrap_or(f32::MAX);
+    areas.get(areas.len() / 2).map(|v| *v as f32).unwrap_or(f32::MAX)
+}
+
+// 装饰块过滤(字形通道): 棋子字形尺寸一致, 而炮位空槽等装饰是无彩深色且明显更大
+fn make_deco_filter(glyph: bool, blobs: &[Blob]) -> impl Fn(&Blob) -> bool + '_ {
+    let med = median_area(blobs);
     move |b: &Blob| glyph && b.colored == 0 && b.area as f32 > med * 1.8
 }
 
@@ -1067,13 +1582,16 @@ mod tests {
             }
         }
         // 中局时在炮的出发格画金色标记(模拟平台走子指示, 颜色落在红字掩码内),
-        // 应被"炮恒 3"约束当作标记丢弃
+        // 应被"炮恒 3"约束当作标记丢弃。画成十字而非实心块(实心块会被填充率
+        // 过滤直接剔除, 到不了炮位竞争, 测不出标记干扰)
         if cannon_rows.len() != 1 && board[4][2] == EMPTY {
             let mx = (origin.0 + cell * 2) as i64;
             let my = (origin.1 + cell * 4) as i64;
             for dy in -6i64..=6 {
                 for dx in -6i64..=6 {
-                    put(&mut img, mx + dx, my + dy, [166, 71, 9]);
+                    if dx.abs() <= 1 || dy.abs() <= 1 {
+                        put(&mut img, mx + dx, my + dy, [166, 71, 9]);
+                    }
                 }
             }
         }
@@ -1162,6 +1680,114 @@ mod tests {
         assert_eq!(det.board, game::middle_startpos_flipped());
         assert!(!det.model.cannons_top);
         assert!(det.model.glyph, "真实小程序截图应走字形通道");
+    }
+
+    #[test]
+    fn test_detect_first_midgame_color() {
+        // 对局进行中(炮隔空吃兵 + 兵上移)启动监听: 不依赖开局指纹, 应能自举网格与颜色
+        let board = game::apply_move(&game::startpos_board(), "a0a2");
+        let board = game::apply_move(&board, "b2b1");
+        let img = synth(&board, (57, 93), 41, 42, false);
+        let det = detect_first(&img).unwrap_or_else(|e| panic!("任意局面识别失败: {e}"));
+        assert_eq!(det.board, board);
+        assert!(det.model.cannons_top);
+        // 任意局面自举出的模型后续中局跟踪应正常
+        let next = game::apply_move(&board, "c0c2");
+        let img2 = synth(&next, (57, 93), 41, 7, false);
+        let crop_img = crop_image(&img2, det.crop);
+        assert_eq!(detect_frame(&det.model, &crop_img).unwrap(), next);
+    }
+
+    #[test]
+    fn test_detect_first_midgame_wechat() {
+        // 微信小程序平台中局启动: 炮 c4 上移(家格露空槽+金色标记)、兵 a2 下移到 a3
+        // (字形中心叠金色标记), 横幅/头像/按钮条噪声下应能自举且不丢被标记的兵
+        let board = game::apply_move(&game::middle_startpos_flipped(), "c4c3");
+        let board = game::apply_move(&board, "a2a3");
+        let img = synth_wechat(&board, (120, 100), 40);
+        let det = detect_first(&img).unwrap_or_else(|e| panic!("微信风格任意局面识别失败: {e}"));
+        assert_eq!(det.board, board);
+        assert!(!det.model.cannons_top, "炮在下方");
+        assert!(det.model.glyph, "橙红底平台应走字形通道");
+        // 金色标记不应被当作第 4 门炮
+        assert_eq!(game::counts(&det.board), (3, 15));
+    }
+
+    #[test]
+    fn test_detect_first_late_midgame_wechat() {
+        // 三炮全部离开家行: 家行整行空出, 网格端点出现平移歧义,
+        // 行归属按"空端行在炮侧"(炮在下方 -> 底行是空的家行)推断应得到正确局面
+        let board = game::apply_move(&game::middle_startpos_flipped(), "b4b3");
+        let board = game::apply_move(&board, "d4d3");
+        let board = game::apply_move(&board, "c4c3");
+        let img = synth_wechat(&board, (120, 100), 40);
+        let det = detect_first(&img).unwrap_or_else(|e| panic!("微信风格残局识别失败: {e}"));
+        assert_eq!(det.board, board);
+        assert!(!det.model.cannons_top);
+    }
+
+    #[test]
+    fn test_model_shifted_keeps_lattice() {
+        // 网格平移一格后仍在(平移后的)格点上吸附出整体平移的局面:
+        // 这是"纠"按钮平移对齐(worker::align_model)的几何基础
+        let board = game::middle_startpos_board();
+        let img = synth(&board, (57, 93), 41, 42, false);
+        let det = detect_first(&img).unwrap();
+        let m = det.model.shifted(1, 0);
+        let mut expect = [[game::EMPTY; game::SIZE]; game::SIZE];
+        for y in 0..game::SIZE {
+            for x in 1..game::SIZE {
+                expect[y][x - 1] = board[y][x];
+            }
+        }
+        assert_eq!(detect_frame(&m, &crop_image(&img, det.crop)).unwrap(), expect);
+    }
+
+    #[test]
+    fn test_detect_first_midgame_real_screenshot() {
+        // 用户微信小程序窗口的真实中局截图(2026-10-16 "任意局面启动"需求的原始报错现场,
+        // 由截图存到 target/midgame_real.png, 不存在时跳过): 炮 b0/d0/a2 在上,
+        // 兵 13 枚, 底部有成排按钮噪声, 腐蚀通道字形质心相对格点整体偏移
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/target/midgame_real.png");
+        let Ok(reader) = xcap::image::ImageReader::open(path) else {
+            return;
+        };
+        let img = reader.decode().expect("解码截图失败").to_rgba8();
+        let det = detect_first(&img).unwrap_or_else(|e| panic!("真实中局截图识别失败: {e}"));
+        let rows = [" C C ", " S   ", "C  SS", "SSSSS", "SSSSS"];
+        let mut expect = [[EMPTY; game::SIZE]; game::SIZE];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                expect[y][x] = c;
+            }
+        }
+        assert_eq!(det.board, expect);
+        assert!(det.model.cannons_top);
+        assert!(det.model.glyph, "真实小程序截图应走字形通道");
+    }
+
+    #[test]
+    fn test_detect_first_midgame_real2_screenshot() {
+        // 用户微信小程序窗口的第二张真实中局截图(2026-10-16 "炮的候选仅 2 个"报错现场):
+        // 炮 b0/c0 在上(变体开局位, d2 为前进炮), 兵 14 枚, 第 1 行空。
+        // 该帧暴露两个坑: 棋盘下方装饰行与真棋盘在窗口打分上并列(需枚举窗口+
+        // 分类校验), 以及并列间距中更大者把格点倾斜到炮的容差外(需 minimax 裁决)
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/target/midgame_real2.png");
+        let Ok(reader) = xcap::image::ImageReader::open(path) else {
+            return;
+        };
+        let img = reader.decode().expect("解码截图失败").to_rgba8();
+        let det = detect_first(&img).unwrap_or_else(|e| panic!("真实中局截图2识别失败: {e}"));
+        let rows = [" CC  ", "     ", "SSSCS", "SSSSS", "SSSSS"];
+        let mut expect = [[EMPTY; game::SIZE]; game::SIZE];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                expect[y][x] = c;
+            }
+        }
+        assert_eq!(det.board, expect);
+        assert!(det.model.cannons_top);
+        assert!(det.model.glyph);
     }
 
     #[test]
