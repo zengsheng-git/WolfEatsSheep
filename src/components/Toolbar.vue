@@ -13,6 +13,7 @@ import {
     NSelect,
     NDrawer,
     NDrawerContent,
+    NModal,
     NSpace,
     NTooltip,
     NEmpty,
@@ -27,7 +28,7 @@ interface EngineConfig {
     time: number;
     alt_score_gap: number;
     hint_level: number;
-    my_camp: string;
+    my_camp: string; // 后端自动判定(炮在画面哪侧执哪方), 前端只读取
 }
 
 // 缩放由 App 应用到窗口
@@ -51,11 +52,6 @@ const hintOptions = [
     { label: "初级(深度4)", value: 3 },
     { label: "中级(深度5)", value: 4 },
     { label: "高级(深度6)", value: 5 },
-];
-
-const campOptions = [
-    { label: "执炮(先行)", value: "w" },
-    { label: "执兵(后行)", value: "b" },
 ];
 
 const config = ref<EngineConfig>({
@@ -214,7 +210,12 @@ async function startListen() {
                     try {
                         await invoke("start_listen", { target: window });
                         isEngineRunning.value = true;
+                        await refreshMyCamp();
                     } catch (error) {
+                        // 自动识别失败且已保存首帧截图: 引导在截图上点炮/点兵后重试
+                        if (String(error).includes("首帧截图已保存") && (await openAnnotate(window))) {
+                            return;
+                        }
                         dialog.error({
                             title: "启动监听失败",
                             content: String(error),
@@ -251,9 +252,10 @@ async function setEngineHintLevel() {
     await invoke("set_engine_hint_level", { level: config.value.hint_level });
 }
 
-async function setMyCamp() {
-    await invoke("set_my_camp", { camp: config.value.my_camp });
-    mirrorStore.myCamp = config.value.my_camp;
+// 监听启动后取回后端按画面自动判定的我方阵营(用于我/敌标签与箭头着色)
+async function refreshMyCamp() {
+    const result: EngineConfig = await invoke("get_engine_config");
+    mirrorStore.myCamp = result.my_camp === "b" ? "b" : "w";
 }
 
 async function getEngineConfig() {
@@ -262,11 +264,80 @@ async function getEngineConfig() {
         ...result,
         time: Number((result.time / 1000).toFixed(1)),
     };
-    mirrorStore.myCamp = result.my_camp === "b" ? "b" : "w";
 }
 
 async function toggleEngine() {
     isEngineRunning.value ? await stopListen() : await startListen();
+}
+
+// ---- 启动标注: 自动识别失败时, 在首帧截图上点一门炮和一枚兵辅助识别 ----
+
+const annotate = ref(false);
+const annotateImg = ref("");
+const annotateStep = ref(0); // 0=待点炮 1=待点兵 2=完成
+const annotateError = ref("");
+const cannonPt = ref<{ x: number; y: number } | null>(null);
+const soldierPt = ref<{ x: number; y: number } | null>(null);
+const pendingTarget = ref<Window | null>(null);
+
+// 取已保存的首帧截图并打开标注弹窗; 无截图(非识别失败)返回 false
+async function openAnnotate(target: Window): Promise<boolean> {
+    try {
+        const url = await invoke<string | null>("first_frame_dataurl");
+        if (!url) return false;
+        annotateImg.value = url;
+    } catch {
+        return false;
+    }
+    cannonPt.value = null;
+    soldierPt.value = null;
+    annotateStep.value = 0;
+    annotateError.value = "";
+    pendingTarget.value = target;
+    annotate.value = true;
+    return true;
+}
+
+function onAnnotateClick(ev: MouseEvent) {
+    const el = ev.target as HTMLImageElement;
+    if (!el.naturalWidth) return;
+    const rect = el.getBoundingClientRect();
+    const pt = {
+        x: ((ev.clientX - rect.left) / rect.width) * el.naturalWidth,
+        y: ((ev.clientY - rect.top) / rect.height) * el.naturalHeight,
+    };
+    if (annotateStep.value === 0) {
+        cannonPt.value = pt;
+        annotateStep.value = 1;
+    } else if (annotateStep.value === 1) {
+        soldierPt.value = pt;
+        annotateStep.value = 2;
+    }
+}
+
+// 带标注的两方颜色重试启动
+async function retryWithHint() {
+    if (!pendingTarget.value || !cannonPt.value || !soldierPt.value) return;
+    try {
+        await invoke("start_listen", {
+            target: pendingTarget.value,
+            cannon: cannonPt.value,
+            soldier: soldierPt.value,
+        });
+        annotate.value = false;
+        isEngineRunning.value = true;
+        await refreshMyCamp();
+    } catch (error) {
+        annotateError.value = String(error);
+        // 仍失败: 局面可能已变化, 刷新截图重新点
+        cannonPt.value = null;
+        soldierPt.value = null;
+        annotateStep.value = 0;
+        if (String(error).includes("首帧截图已保存")) {
+            const url = await invoke<string | null>("first_frame_dataurl");
+            if (url) annotateImg.value = url;
+        }
+    }
 }
 
 // ---- 手动纠错: 以镜像棋盘的标注局面重校准颜色与同步状态 ----
@@ -324,8 +395,6 @@ async function applyCalibrate() {
         <n-space vertical size="small">
             <n-flex align="center" justify="space-between">
                 <n-flex align="center" :size="8">
-                    <n-select v-model:value="config.my_camp" :options="campOptions" :consistent-menu-width="false"
-                        placeholder="我方阵营" class="camp-select" @update:value="setMyCamp" />
                     <n-tooltip trigger="hover" placement="bottom">
                         <template #trigger>
                             <n-select
@@ -457,6 +526,35 @@ async function applyCalibrate() {
                 </n-form>
             </n-drawer-content>
         </n-drawer>
+
+        <!-- 启动标注: 自动识别失败时在首帧截图上点炮/点兵 -->
+        <n-modal v-model:show="annotate" :mask-closable="false" transform-origin="center">
+            <n-card class="annotate-card" title="自动识别失败 - 请点两下帮助识别" size="small" role="dialog"
+                closable @close="annotate = false">
+                <n-space vertical size="small">
+                    <div class="annotate-tip">
+                        {{
+                            annotateStep === 0
+                                ? "第 1 步: 点击截图中任意一门炮(红字)"
+                                : annotateStep === 1
+                                    ? "第 2 步: 点击截图中任意一枚兵(黑字)"
+                                    : "已选好, 点击\"重新识别\"重试"
+                        }}
+                    </div>
+                    <img v-if="annotateImg" :src="annotateImg" class="annotate-img" @click="onAnnotateClick" />
+                    <n-flex justify="space-between" align="center">
+                        <span class="annotate-error">{{ annotateError }}</span>
+                        <n-flex :size="8">
+                            <n-button size="small" quaternary @click="annotate = false">取消</n-button>
+                            <n-button size="small" type="primary" :disabled="annotateStep !== 2"
+                                @click="retryWithHint">
+                                重新识别
+                            </n-button>
+                        </n-flex>
+                    </n-flex>
+                </n-space>
+            </n-card>
+        </n-modal>
     </n-card>
 </template>
 
@@ -467,12 +565,32 @@ async function applyCalibrate() {
     border-radius: 8px;
 }
 
-.camp-select {
-    width: 120px;
-}
-
 .zoom-select {
     width: 88px;
+}
+
+.annotate-card {
+    width: fit-content;
+    max-width: 80vw;
+}
+
+.annotate-img {
+    display: block;
+    max-width: 72vw;
+    max-height: 58vh;
+    cursor: crosshair;
+    border-radius: 4px;
+}
+
+.annotate-tip {
+    font-size: 13px;
+    color: var(--n-text-color);
+}
+
+.annotate-error {
+    font-size: 12px;
+    color: #d03050;
+    max-width: 40vw;
 }
 
 :deep(.n-button) {

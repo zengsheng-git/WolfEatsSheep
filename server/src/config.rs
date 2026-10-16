@@ -141,15 +141,5 @@ pub async fn set_engine_hint_level(level: i32) {
     crate::bump_hint_version();
 }
 
-#[tauri::command]
-pub async fn set_my_camp(camp: String) {
-    let state = SHARED_STATE.get().unwrap();
-    let mut config = state.config.write().unwrap();
-    if camp == "w" || camp == "b" {
-        config.engine.my_camp = camp.chars().next().unwrap();
-        config.save();
-        debug!("set_my_camp: {}", camp);
-        // 箭头着色随我方阵营变化, 重算提示立即生效
-        crate::bump_hint_version();
-    }
-}
+// 我方阵营(my_camp)不再由界面设置: 启动监听时按画面自动判定
+// (炮在屏幕哪一侧玩家就执哪方, 见 worker::start_listen / refresh_camp)

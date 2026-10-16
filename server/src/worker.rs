@@ -425,6 +425,25 @@ fn analyse(
     Some((expect_move, expect_board))
 }
 
+// 开局帧自动判定我方阵营: 平台把玩家摆在屏幕下方, 而开局时炮必在某一侧
+// 边行 -- 炮在顶行=玩家执兵, 在底行=玩家执炮。只写内存配置不落盘
+// (每次启动监听都会按画面重判)
+fn refresh_camp(board: &Board) {
+    if !game::is_startpos(board) {
+        return;
+    }
+    let want = if board[0].contains(&game::CANNON) { 'b' } else { 'w' };
+    let shared_state = SHARED_STATE.get().unwrap();
+    let mut config = shared_state.config.write().unwrap();
+    if config.engine.my_camp != want {
+        config.engine.my_camp = want;
+        drop(config);
+        info!("开局帧自动判定我方阵营: {}", if want == 'w' { "炮" } else { "兵" });
+        // 阵营影响箭头着色与镜像方向, 递增版本号让监听线程立即按新阵营重算
+        crate::bump_hint_version();
+    }
+}
+
 // 处理循环: 包一层捕获 panic, 线程内异常只终止本次监听, 不连锁影响界面
 fn process_analysis_loop_guarded(context: AnalysisContext) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -489,6 +508,8 @@ fn process_analysis_loop(mut context: AnalysisContext) {
             continue;
         };
         bad_frames = 0;
+        // 开局帧自动复核我方阵营(新开局时自愈启动时的误判)
+        refresh_camp(&board);
         let camp = context.my_camp();
 
         current_state = match current_state {
@@ -620,8 +641,20 @@ fn handle_board_change(context: &mut AnalysisContext, board: Board, camp: &Camp)
     }
 }
 
+// 启动标注的点: 用户在首帧截图上点一门炮/一枚兵的图像坐标(像素)
+#[derive(serde::Deserialize, Debug)]
+pub struct HintPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
 #[tauri::command]
-pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> {
+pub async fn start_listen(
+    app: AppHandle,
+    target: Window,
+    cannon: Option<HintPoint>,
+    soldier: Option<HintPoint>,
+) -> Result<(), String> {
     trace!("start_listen");
     {
         let shared_state = SHARED_STATE.get().unwrap();
@@ -638,9 +671,25 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
             return Err("无法截取目标窗口画面".to_string());
         };
 
+        // 用户点过炮/兵时采样两方颜色作为分类提示(自动识别失败后的引导流程)
+        let hint = match (cannon, soldier) {
+            (Some(c), Some(s)) => {
+                let hc = vision::sample_camp_color(&image, c.x, c.y);
+                let hs = vision::sample_camp_color(&image, s.x, s.y);
+                match (hc, hs) {
+                    (Some(cc), Some(sc)) => Some(vision::ColorHint { cannon: cc, soldier: sc }),
+                    _ => {
+                        warn!("启动标注采样失败, 忽略提示继续自动识别");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // 首帧自举网格几何与两方颜色(开局指纹优先, 任意局面拟合兜底, 见 vision::detect_first),
         // 失败时保存首帧截图, 便于按真实画面调优识别参数
-        let detect = match vision::detect_first(&image) {
+        let detect = match vision::detect_first(&image, hint.as_ref()) {
             Ok(det) => det,
             Err(e) => {
                 // 识别失败时保存首帧截图, 便于按真实画面调优识别参数
@@ -668,7 +717,19 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
         };
         trace!("首帧局面: {:?}", detect.board);
         window.set_sub_bound(detect.crop.0, detect.crop.1, detect.crop.2, detect.crop.3);
-        info!("识别到棋盘, crop={:?} cannons_top={}", detect.crop, detect.model.cannons_top);
+        // 我方阵营自动判定: 平台永远把玩家摆在屏幕下方, 炮在画面哪一侧玩家就执哪方。
+        // 中局接入时炮可能已越境, 判错只影响镜像方向与我/敌标签(行棋方随第一步
+        // 走子自动校准), 且每到新开局由 refresh_camp 自愈
+        {
+            let camp = if detect.model.cannons_top { 'b' } else { 'w' };
+            SHARED_STATE.get().unwrap().config.write().unwrap().engine.my_camp = camp;
+        }
+        info!(
+            "识别到棋盘, crop={:?} cannons_top={}, 我方执{}",
+            detect.crop,
+            detect.model.cannons_top,
+            if detect.model.cannons_top { "兵" } else { "炮" }
+        );
 
         let context = AnalysisContext::new(app.clone(), window, detect.model);
         let listen_thread = thread::spawn(move || {
@@ -678,6 +739,33 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
         *listen_slot = Some(listen_thread);
     }
     Ok(())
+}
+
+// 启动失败时取已保存的首帧截图(转 data URL 供前端展示), 供"点炮/点兵"标注引导
+#[tauri::command]
+pub fn first_frame_dataurl(app: AppHandle) -> Option<String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("sanpao").join("first_frame.png"))?;
+    let bytes = std::fs::read(&path).ok()?;
+    Some(format!("data:image/png;base64,{}", base64_encode(&bytes)))
+}
+
+// 标准base64编码(无依赖, 输入为PNG字节数组)
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 #[tauri::command]

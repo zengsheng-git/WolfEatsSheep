@@ -60,6 +60,7 @@ pub fn run() {
             listen::list_windows,
             worker::start_listen,
             worker::stop_listen,
+            worker::first_frame_dataurl,
             worker::calibrate,
             worker::recalibrate,
             config::get_engine_config,
@@ -67,7 +68,6 @@ pub fn run() {
             config::set_engine_time,
             config::set_engine_alt_score_gap,
             config::set_engine_hint_level,
-            config::set_my_camp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
