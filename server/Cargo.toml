@@ -3,10 +3,21 @@ name = "sanpao"
 version = "0.1.0"
 description = "三炮十五兵走法提示工具"
 edition = "2024"
+default-run = "sanpao"
 
 [lib]
 name = "sanpao_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 求解器 CLI 独立于应用构建: 平时/打包不编译它, 避免与正在运行的求解进程抢 exe 文件锁
+# 运行: cargo run --release --features solver --bin solver
+[[bin]]
+name = "solver"
+path = "src/bin/solver.rs"
+required-features = ["solver"]
+
+[features]
+solver = []
 
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
@@ -17,6 +28,7 @@ tauri-plugin-opener = "2.2.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 xcap = { version = "0.5.1" }
+memmap2 = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
 tracing-appender = "0.2"

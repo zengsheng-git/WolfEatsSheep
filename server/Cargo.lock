@@ -3490,6 +3490,7 @@ dependencies = [
 name = "sanpao"
 version = "0.1.0"
 dependencies = [
+ "memmap2",
  "serde",
  "serde_json",
  "tauri",

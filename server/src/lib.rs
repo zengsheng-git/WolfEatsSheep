@@ -9,9 +9,11 @@ use tauri::Manager as _;
 
 mod ai;
 mod config;
-mod game;
+pub mod game;
 mod listen;
 mod logger;
+pub mod oracle;
+pub mod solver;
 mod vision;
 mod worker;
 

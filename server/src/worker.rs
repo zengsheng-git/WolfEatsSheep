@@ -346,6 +346,12 @@ fn save_stuck_frame(app: &AppHandle, image: &ImageBuffer<Rgba<u8>, Vec<u8>>) {
 }
 
 fn search_with_config(board: Board, camp: Camp, config: &EngineConfig) -> Option<ai::Analysis> {
+    // 有求解器值表且未降智时优先使用: 严格最优着法
+    if config.hint_level == 0
+        && let Some(perfect) = crate::oracle::analyze(&board, camp)
+    {
+        return Some(perfect);
+    }
     let depth = ai::hint_depth(config.hint_level, config.depth);
     let limits = SearchLimits { depth, time_ms: config.time as u64 };
     ai::analyze(&board, camp, limits, config.alt_score_gap)
@@ -378,7 +384,8 @@ fn analyse(
         deviation: None,
         board: game::board_map(&board),
         state: "分析".to_string(),
-        source: "引擎".to_string(),
+        // 深度 99 是查表分析(oracle)的约定标记, 区分提示来源
+        source: if result.depth == 99 { "求解器" } else { "引擎" }.to_string(),
         camp: camp.to_char(),
         over: None,
     };
