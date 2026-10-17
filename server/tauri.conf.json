@@ -28,7 +28,12 @@
     },
     "bundle": {
         "active": true,
-        "targets": "all",
+        "targets": ["msi"],
+        "windows": {
+            "wix": {
+                "language": "zh-CN"
+            }
+        },
         "icon": [
             "icons/32x32.png",
             "icons/64x64.png",

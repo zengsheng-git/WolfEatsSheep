@@ -192,7 +192,11 @@ listen('analyse', async (event) => {
 
 <style scoped>
 #chessboard {
-    position: relative;
+    /* 三面板布局(工具栏/棋盘/分析)全部绝对定位, 坐标与 App.vue 分隔线几何对齐,
+       避免文档流里工具栏高度变化把面板顶出窗口 */
+    position: absolute;
+    left: 12px;
+    top: 104px;
 }
 
 #chessboard.calibrating .piece-wrap {

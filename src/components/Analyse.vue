@@ -44,13 +44,14 @@ const best = ref({
     evalType: "info" as "error" | "success" | "info",
 })
 
-listen('analyse', async (event) => {
-    let data = event.payload as Analyse;
+// 处理一条分析结果(正常来自 tauri 事件; 开发模式下也暴露给页面注入, 便于纯浏览器复现排版)
+function applyAnalyse(data: Analyse) {
     best.value.move = data.moves[0] ?? "----";
     best.value.depth = data.depth;
     best.value.source = data.source;
     lastScore.value = data.score;
-    pvs.value = data.pvs ?? [];
+    // 查表分析的主线可长达数百步, 截断显示与预演, 保证列表可读
+    pvs.value = (data.pvs ?? []).slice(0, 30);
     altIccs.value = data.alternatives ?? [];
     deviation.value = data.deviation ?? null;
     analysisBoard.value = data.board ?? [];
@@ -59,7 +60,7 @@ listen('analyse', async (event) => {
     if (previewActive) restoreBoard();
     alternatives.value = data.alt_moves ?? [];
     altScores.value = data.alt_scores ?? [];
-    followUps.value = data.moves;
+    followUps.value = data.moves.slice(0, 30);
     const isMine = data.camp === mirrorStore.myCamp;
     bestCamp.value = data.camp === "b" ? "b" : "w";
     best.value.side = data.camp === "w" ? "炮方" : "兵方";
@@ -79,6 +80,14 @@ listen('analyse', async (event) => {
         }
     }
     mirrorStore.arrows = arrows;
+}
+
+if (import.meta.env.DEV && !(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__) {
+    (window as unknown as { __mockAnalyse?: (d: Analyse) => void }).__mockAnalyse = applyAnalyse;
+}
+
+listen('analyse', async (event) => {
+    applyAnalyse(event.payload as Analyse);
 })
 
 function campName(camp: string): string {
@@ -147,7 +156,7 @@ function previewAlt(index: number) {
 
 <template>
     <n-card title="局面分析" :bordered="false" class="textlog">
-        <n-flex justify="space-between" align="end">
+        <n-flex justify="space-between" align="center" :wrap="true">
             <n-text type="info" class="analyse-title" strong @mouseenter="previewLine(0)" @mouseleave="restoreBoard()">
                 {{ best.side }} {{ best.move }}
             </n-text>
@@ -197,7 +206,8 @@ function previewAlt(index: number) {
 
 .follow-ups {
     margin-top: 6px;
-    max-height: 260px;
+    flex: 1 1 auto;
+    min-height: 60px;
     overflow-y: auto;
     font-size: 12px;
 }
@@ -213,7 +223,13 @@ function previewAlt(index: number) {
 }
 
 .analyse-title {
-    font-size: x-large;
+    /* 20px 下最长记谱("兵方 炮 b1 吃 b4")约 220px, 卡片内容区约 260px 放得下;
+       再长则省略号兜底, 避免把右侧"来源/深度"标签组挤出或叠上文字 */
+    font-size: 20px;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     cursor: pointer;
     border-radius: 2px;
     padding: 0 2px;
@@ -224,7 +240,10 @@ function previewAlt(index: number) {
 }
 
 .alternatives {
+    flex-shrink: 0;
     margin-top: 8px;
+    max-height: 110px;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -241,10 +260,40 @@ function previewAlt(index: number) {
     background-color: rgba(24, 160, 88, 0.15);
 }
 
+/* 固定高度卡片: 绝对定位与 App.vue 分隔线几何对齐, 内部纵向弹性布局,
+   让主线列表占满剩余空间滚动, 底部次优不被裁掉 */
 .textlog {
+    position: absolute;
     width: 300px;
     height: 440px;
     left: 336px;
     top: 104px;
+    display: flex;
+    flex-direction: column;
+}
+
+/* 固定高度卡片: 绝对定位与 App.vue 分隔线几何对齐, 内部纵向弹性布局,
+   让主线列表占满剩余空间滚动, 底部次优不被裁掉
+   (注意 naive-ui 的内容区类名是 n-card-content, 无双下划线) */
+.textlog :deep(.n-card-header) {
+    flex-shrink: 0;
+}
+
+.textlog :deep(.n-card-content) {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* 内容超出固定高度时只允许"后续"列表被压缩滚动,
+   其余行(标题/评分/终局/偏离/次优)绝不收缩, 否则大字号行会被竖向裁成半截字 */
+.textlog :deep(.n-card-content) > * {
+    flex-shrink: 0;
+}
+
+.textlog :deep(.n-card-content) > .follow-ups {
+    flex-shrink: 1;
 }
 </style>
