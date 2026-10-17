@@ -22,7 +22,7 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { depth: 6, time: 1000, alt_score_gap: 100, hint_level: 0, my_camp: 'w' }
+        Self { depth: 12, time: 1000, alt_score_gap: 100, hint_level: 0, my_camp: 'w' }
     }
 }
 
