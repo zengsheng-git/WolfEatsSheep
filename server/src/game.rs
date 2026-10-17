@@ -10,8 +10,8 @@ pub const CANNON: char = 'C';
 pub const SOLDIER: char = 'S';
 pub const EMPTY: char = ' ';
 
-// 兵被吃到该数量以下时炮方获胜(规则: 吃掉最后一枚兵)
-pub const SOLDIER_LOSE_COUNT: usize = 0;
+// 兵被吃到剩该数量及以下时炮方获胜(规则: 剩 3 枚兵已无力围死三炮, 即判炮胜)
+pub const SOLDIER_LOSE_COUNT: usize = 3;
 
 // 连续无吃子步数达到该值判和, 防止双方无限空移
 pub const DRAW_NO_CAPTURE_PLIES: usize = 60;
@@ -408,20 +408,15 @@ mod tests {
 
     #[test]
     fn test_winner_soldiers_too_few() {
-        // 吃掉最后一枚兵才算炮胜, 剩 2 枚时对局仍继续
+        // 兵被吃到剩 3 枚即炮胜(3 枚兵已无力围死三炮), 剩 4 枚时对局仍继续
         let mut board = [[EMPTY; SIZE]; SIZE];
         board[0][0] = CANNON;
         board[0][2] = CANNON;
         board[0][4] = CANNON;
-        board[4][1] = SOLDIER;
-        board[4][3] = SOLDIER;
-        assert_eq!(winner(&board), None, "剩 2 枚兵对局未结束");
-        let mut one = board;
-        one[4][1] = EMPTY;
-        assert_eq!(winner(&one), None, "剩 1 枚兵对局仍未结束");
-        let mut last = one;
-        last[4][3] = EMPTY;
-        assert_eq!(winner(&last), Some(Camp::Cannon), "最后一枚兵被吃掉才是炮胜");
+        board[4] = [SOLDIER, SOLDIER, EMPTY, SOLDIER, SOLDIER];
+        assert_eq!(winner(&board), None, "剩 4 枚兵对局未结束");
+        board[4][1] = EMPTY; // 被吃到只剩 3 枚
+        assert_eq!(winner(&board), Some(Camp::Cannon), "兵被吃到剩 3 枚即炮胜");
     }
 
     #[test]

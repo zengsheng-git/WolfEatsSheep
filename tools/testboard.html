@@ -82,7 +82,7 @@ function legalMoves(camp) {
 function winner() {
     let soldiers = 0;
     for (const row of board) for (const c of row) if (c === "S") soldiers++;
-    if (soldiers <= 2) return "炮方胜(兵已不足)";
+    if (soldiers <= 3) return "炮方胜(兵已不足)";
     const cMoves = legalMoves("C"), sMoves = legalMoves("S");
     if (cMoves.length === 0) return "兵方胜(围困三炮)";
     if (sMoves.length === 0) return "炮方胜(兵无路可走)";
