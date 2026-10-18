@@ -624,6 +624,11 @@ fn eval(board: &Board, camp: Camp) -> isize {
     }
 }
 
+// 供 oracle 的同值类着法排序使用: 返回行棋方视角静态分
+pub fn static_eval(board: &Board, camp: Camp) -> isize {
+    eval(board, camp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

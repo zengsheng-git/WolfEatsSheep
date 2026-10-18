@@ -116,22 +116,55 @@ fn is_cap(board: &Board, mv: &str) -> bool {
     game::xy_of(&mv[2..]).map(|(x, y)| board[y][x] != game::EMPTY).unwrap_or(false)
 }
 
-// 最优着法: 值类优先, 同类吃子优先(加速终局并重置无吃子计数)
-fn pick_best(board: &Board, camp: Camp) -> Option<(String, i32)> {
-    let mut best: Option<(String, i32, bool)> = None;
-    for mv in game::legal_moves(board, &camp) {
-        let Some(v) = move_value(board, camp, &mv) else { continue };
-        let cls = cls_of(v, camp);
-        let cap = is_cap(board, &mv);
-        let replace = match &best {
-            None => true,
-            Some((_, bc, bcap)) => cls > *bc || (cls == *bc && cap && !*bcap),
+// 同值类着法的实用排序。值类(胜/和/负)严格优先, 同类内按阵营与值类挑"最合理"的一步:
+//   - 炮方: 吃子优先(推进终局 + 重置无吃子计数), 之后按静态评估(兵越少越好/活动度);
+//   - 兵方胜势(cls=+1): 进攻评估优先(压缩炮活动度、逼近围堵), 推动向终局收敛;
+//   - 兵方非胜势(和/败): 纯防守——对方可吃着法数、受威胁兵数越少越好。
+//     和棋局面里保和着法往往全部自带被吃敞口(必须挡在炮的跳吃线上才守得住),
+//     此时"少送一个是一个"比任何进攻姿态都实际。
+// 排序只在同类内挑选, 不改变任何局面的理论结果
+fn ranked_moves(board: &Board, camp: Camp) -> Vec<(String, i32)> {
+    let mut list: Vec<(String, i32, bool, usize, usize, isize)> = game::legal_moves(board, &camp)
+        .into_iter()
+        .map(|mv| {
+            // 子层表缺失时按和棋类兜底(完整表下不会发生)
+            let cls = move_value(board, camp, &mv).map(|v| cls_of(v, camp)).unwrap_or(0);
+            let child = game::apply_move(board, &mv);
+            // 对方走后立即可吃的着法数(敞口) 与 受威胁的不同兵数(每回合至多被吃一枚)
+            let opp_moves = game::legal_moves(&child, &camp.opposite());
+            let opp_caps = opp_moves.iter().filter(|m| is_cap(&child, m)).count();
+            let mut threatened: Vec<(usize, usize)> = Vec::new();
+            if camp == Camp::Soldier {
+                for m in &opp_moves {
+                    if is_cap(&child, m)
+                        && let Some((tx, ty)) = game::xy_of(&m[2..])
+                        && !threatened.contains(&(tx, ty))
+                    {
+                        threatened.push((tx, ty));
+                    }
+                }
+            }
+            let ev = -ai::static_eval(&child, camp.opposite());
+            let cap = is_cap(board, &mv);
+            (mv, cls, cap, opp_caps, threatened.len(), ev)
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        let key = |e: &(String, i32, bool, usize, usize, isize)| {
+            // 键: 全序降序比较。实测结论(见 experiment_sheep_hint_quality):
+            //  - 兵方和棋/败势: 只看防守(敞口、受威胁兵数升序), 掺入进攻评估会主动
+            //    站上跳吃线导致持续送子;  - 兵方胜势: 只看进攻评估, 安全优先会让主线
+            //    无法收敛到终局(兵胜需主动弃子围堵);  - 炮方: 吃子优先后按评估
+            match (camp, e.1) {
+                (Camp::Soldier, cls) if cls <= 0 => (cls, 0isize, -(e.3 as isize), -(e.4 as isize), 0),
+                (Camp::Soldier, _) => (e.1, 1isize, e.5, 0, 0),
+                (Camp::Cannon, _) => (e.1, 1isize + e.2 as isize, e.5, 0, 0),
+                (Camp::None, _) => (e.1, 0, 0, 0, 0),
+            }
         };
-        if replace {
-            best = Some((mv, cls, cap));
-        }
-    }
-    best.map(|(mv, cls, _)| (mv, cls))
+        key(b).cmp(&key(a))
+    });
+    list.into_iter().map(|(mv, cls, _, _, _, _)| (mv, cls)).collect()
 }
 
 // 完美分析: 返回与搜索引擎同构的结果, 分数映射为杀棋分便于前端展示
@@ -145,17 +178,13 @@ pub fn analyze(board: &Board, camp: Camp) -> Option<Analysis> {
     }
     let val = cls_of(state_value(board, camp)?, camp);
 
-    let scored: Vec<(String, i32)> = game::legal_moves(board, &camp)
-        .into_iter()
-        .map(|mv| {
-            // 子层表缺失时按和棋类兜底(完整表下不会发生)
-            let cls = move_value(board, camp, &mv).map(|v| cls_of(v, camp)).unwrap_or(0);
-            (mv, cls)
-        })
-        .collect();
-    let (best_mv, best_cls) = scored.iter().max_by_key(|(mv, cls)| (*cls, is_cap(board, mv)))?.clone();
+    let scored = ranked_moves(board, camp);
+    let Some((best_mv, best_cls)) = scored.first().cloned() else {
+        return None;
+    };
 
-    // 主线: 双方沿完美着法推演到终局, 和棋线路遇重复局面即停
+    // 主线: 双方沿同类最优着法推演到终局, 遇重复局面即停。
+    // 同类内优先走向"未出现过的子局面"(防自循环), 否则和棋/慢胜主线几步就重复截断
     let mut pv = Vec::new();
     let mut cur = *board;
     let mut cur_camp = camp;
@@ -167,26 +196,40 @@ pub fn analyze(board: &Board, camp: Camp) -> Option<Analysis> {
         if !seen.insert((to_solver_board(&cur), cur_camp.to_char())) {
             break;
         }
-        let Some((mv, _)) = pick_best(&cur, cur_camp) else { break };
+        let ranked = ranked_moves(&cur, cur_camp);
+        let Some((top_mv, top_cls)) = ranked.first().cloned() else { break };
+        let fresh = ranked
+            .iter()
+            .take_while(|(_, c)| *c == top_cls)
+            .find(|(m, _)| {
+                let child = game::apply_move(&cur, m);
+                !seen.contains(&(to_solver_board(&child), cur_camp.opposite().to_char()))
+            });
+        let mv = fresh.map(|(m, _)| m.clone()).unwrap_or(top_mv);
         pv.push(mv.clone());
         cur = game::apply_move(&cur, &mv);
         cur_camp = cur_camp.opposite();
     }
 
-    // 次优: 与最优同值类的着法
+    // 次优: 与最优同值类的着法(按同类排序给出, 靠前的更"稳")
     let mut alternatives = Vec::new();
     let mut alt_scores = Vec::new();
-    for (mv, cls) in scored.iter().skip(0) {
+    for (mv, cls) in scored.iter() {
         if *cls == best_cls && *mv != best_mv && alternatives.len() < 4 {
             alternatives.push(mv.clone());
             alt_scores.push(0);
         }
     }
 
-    // 分数映射: 胜 = MATE - 主线步数; 负 = 对称; 和 = 0
+    // 分数映射: 主线推到终局时给出确切步数(胜 = MATE - 主线步数, 负对称, 和 = 0);
+    // 值类为胜/负但主线因重复局面截断时, 步数未知, 用 ±MATE 哨兵标记
+    // (引擎路径的杀棋分永远是 MATE - n, n ≥ 1, 不会与哨兵冲突)
+    let terminal = game::winner(&cur).is_some();
     let score = match val {
-        1 => ai::MATE - pv.len() as isize,
-        -1 => -(ai::MATE - pv.len() as isize),
+        1 if terminal => ai::MATE - pv.len() as isize,
+        1 => ai::MATE,
+        -1 if terminal => -(ai::MATE - pv.len() as isize),
+        -1 => -ai::MATE,
         _ => 0,
     };
     Some(Analysis {
@@ -220,6 +263,93 @@ mod tests {
             cur = game::apply_move(&cur, mv);
             camp = camp.opposite();
         }
+    }
+
+    // 临时诊断: 兵方提示质量 — 统计推荐着法的"送子敞口"(走后炮方立即可吃)与可替代性
+    #[test]
+    #[ignore]
+    fn experiment_sheep_hint_quality() {
+        // 场景 A: 中间变体主线 1.c0c2 (理论 和棋)
+        let a = game::apply_move(&game::middle_startpos_board(), "c0c2");
+        walk_and_diag(&a, Camp::Soldier, "A 中间变体和棋主线");
+        // 场景 B: 标准开局炮第一步 c0c1 (判负着法, 兵方必胜)
+        let b = game::apply_move(&game::startpos_board(), "c0c1");
+        walk_and_diag(&b, Camp::Soldier, "B 标准开局炮c0c1后(兵胜)");
+    }
+
+    // 走完该着后炮方立即可吃的着法数(送子敞口)
+    fn cannon_captures_after(board: &Board, mv: &str) -> usize {
+        let child = game::apply_move(board, mv);
+        game::legal_moves(&child, &Camp::Cannon).iter().filter(|m| is_cap(&child, m)).count()
+    }
+
+    fn walk_and_diag(start: &Board, first: Camp, label: &str) {
+        let mut cur = *start;
+        let mut camp = first;
+        let (mut turns, mut chosen_enprise, mut with_safe_alt, mut free_sheep_lost, mut printed) = (0, 0, 0, 0, 0);
+        for ply in 0..400 {
+            if game::winner(&cur).is_some() {
+                break;
+            }
+            if camp == Camp::Soldier {
+                let Some(a) = analyze(&cur, camp) else { break };
+                let chosen = a.pvs[0].clone();
+                let val = state_value(&cur, camp).map(|v| cls_of(v, camp)).unwrap_or(0);
+                let mut same_class = 0;
+                let mut same_class_safe = 0;
+                for mv in game::legal_moves(&cur, &camp) {
+                    let Some(v) = move_value(&cur, camp, &mv) else { continue };
+                    if cls_of(v, camp) == val {
+                        same_class += 1;
+                        if cannon_captures_after(&cur, &mv) == 0 {
+                            same_class_safe += 1;
+                        }
+                    }
+                }
+                let child = game::apply_move(&cur, &chosen);
+                let caps = cannon_captures_after(&cur, &chosen);
+                let wolf_takes = analyze(&child, Camp::Cannon)
+                    .map(|w| is_cap(&child, &w.pvs[0]))
+                    .unwrap_or(false);
+                turns += 1;
+                if caps > 0 {
+                    chosen_enprise += 1;
+                    if same_class_safe > 0 {
+                        with_safe_alt += 1;
+                    }
+                    if wolf_takes {
+                        free_sheep_lost += 1;
+                    }
+                    if printed < 10 {
+                        println!(
+                            "{label} ply{ply} 值类={val} 推荐 {chosen} 敞口x{caps} 狼最佳回应是否吃={wolf_takes} 同类{same_class}个(不送子{same_class_safe}个) 分{}",
+                            a.score
+                        );
+                        printed += 1;
+                    }
+                }
+                cur = child;
+            } else {
+                match analyze(&cur, camp) {
+                    Some(a) => cur = game::apply_move(&cur, &a.pvs[0]),
+                    None => {
+                        let mvs = game::legal_moves(&cur, &camp);
+                        if mvs.is_empty() { break }
+                        cur = game::apply_move(&cur, &mvs[0]);
+                    }
+                }
+            }
+            camp = camp.opposite();
+            if ply % 50 == 49 {
+                let (_, s) = game::counts(&cur);
+                println!("{label} 时间线 ply{ply} 剩兵{s}");
+            }
+        }
+        let (c, s) = game::counts(&cur);
+        println!(
+            "{label}: 兵方回合{turns} 推荐送子敞口{chosen_enprise}次(其中{with_safe_alt}次有同类不送子替代, {free_sheep_lost}次狼最优回应就是白吃) 终局剩炮{c}兵{s} {:?}",
+            game::winner(&cur).map(|w| w.to_char())
+        );
     }
 
     // 需要 k=6 层表已生成(release 运行): 验证查表分析可用且主线步步合法
